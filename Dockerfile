@@ -1,0 +1,17 @@
+FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
+
+WORKDIR /app
+
+ENV PIP_NO_CACHE_DIR=1
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt
+
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

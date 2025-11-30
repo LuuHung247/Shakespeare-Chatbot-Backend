@@ -46,9 +46,10 @@ nano .env  # hoặc dùng editor khác
 ```bash
 # Development mode
 python -m app.main
-
+docker run -d -p 8000:8000 --name shakespeare shakespeare-app
 # Hoặc dùng uvicorn trực tiếp
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
 ````
 
 Server sẽ chạy tại: `http://localhost:8000`

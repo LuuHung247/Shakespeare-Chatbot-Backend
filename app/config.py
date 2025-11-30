@@ -8,18 +8,17 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     
     # LLM Settings
-    LLM_TYPE: Literal["gemini", "local"] = "gemini"
-    
-
+   
+   
+    LLM_TYPE: Literal["gemini", "local", "shakespeare"] = "shakespeare"
     # Google Gemini
     GOOGLE_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-flash"  # hoặc "gemini-1.5-pro", "gemini-1.5-flash"
-    
-    # Local Model
-    LOCAL_MODEL_PATH: str = "models/shakespeare-model"
-    LOCAL_MODEL_NAME: str = "gpt2"  # hoặc model đã fine-tune
+    GEMINI_MODEL: str = "gemini-flash"
     
 
+    # Shakespeare Custom Model
+    SHAKESPEARE_MODEL_NAME: str = "Hancovirus/shakespear_Qwen2.5-3B-Instruct"
+    # Alternative: "Hancovirus/shakespear_llama-3.2-3B-Instruct"
     
     # Generation Settings
     MAX_TOKENS: int = 2000

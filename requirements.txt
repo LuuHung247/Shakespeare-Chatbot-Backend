@@ -23,9 +23,9 @@ google-generativeai==0.3.2
 langchain-google-genai==0.0.6
 
 # Local LLM (nếu dùng)
-# transformers==4.37.0
-# torch==2.1.2
-# accelerate==0.26.1
+transformers==4.37.0
+torch==2.1.2
+accelerate==0.26.1
 
 # Utils
 python-dotenv==1.0.0
