@@ -1,7 +1,7 @@
 from langchain.llms.base import LLM
 from typing import Optional, List, Any, Dict
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, BitsAndBytesConfig
 import threading
 import time
 import re
@@ -40,7 +40,7 @@ class ShakespeareLLM(LLM):
         self._load_model()
     
     def _load_model(self):
-        """Load model và tokenizer"""
+        """Load model và tokenizer tối ưu cho GPU 4GB (GTX 3050 Ti)"""
         if self.tokenizer is None or self.model is None:
             print(f"Loading local Shakespeare model: {self.model_name}")
             try:
@@ -48,16 +48,35 @@ class ShakespeareLLM(LLM):
                     self.model_name, 
                     trust_remote_code=True
                 )
+                
+                # Cấu hình lượng tử hóa 4-bit (NF4) để vừa VRAM 4GB
+                # Giúp tốc độ nhanh gấp 5-10 lần CPU mà chất lượng gần như không đổi
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                )
+
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device_map="auto",
+                    quantization_config=bnb_config, 
+                    device_map="auto",              
                     trust_remote_code=True,
                 )
-                print(f"Model loaded successfully on: {self.model.device}")
+                print(f"Model loaded successfully on GPU (4-bit quantized)")
+            
             except Exception as e:
-                print(f"CRITICAL ERROR loading model: {e}")
-                raise e
+                print(f"Warning: GPU loading failed ({e}). Falling back to CPU.")
+                print("Note: CPU inference will be significantly slower.")
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    device_map="cpu",
+                    torch_dtype=torch.float32,
+                    trust_remote_code=True,
+                )
+                print(f"Model loaded on CPU")
     
     @property
     def _llm_type(self) -> str:
@@ -90,6 +109,7 @@ class ShakespeareLLM(LLM):
         stop_sequences: Optional[List[str]] = None
     ) -> tuple[str, dict]:
         """Core generation logic với streaming"""
+        # Tokenize prompt
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         num_input_tokens = inputs["input_ids"].shape[-1]
@@ -109,6 +129,7 @@ class ShakespeareLLM(LLM):
             streamer=streamer,
         )
         
+        # Chạy model trong thread riêng để stream output
         thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
         thread.start()
         
@@ -120,7 +141,7 @@ class ShakespeareLLM(LLM):
                 print(new_text, end="", flush=True)
             generated_parts.append(new_text)
             
-            # Basic stop sequence checking (optional)
+            # Stop sequence check cơ bản
             if stop_sequences and any(s in new_text for s in stop_sequences):
                 break
         
@@ -130,7 +151,7 @@ class ShakespeareLLM(LLM):
         continuation = "".join(generated_parts)
         generation_time = end_time - start_time
         
-        # Calculate tokens per second (approx)
+        # Tính toán thống kê
         num_new_tokens = 0
         if continuation.strip():
             num_new_tokens = len(self.tokenizer.encode(continuation))
@@ -152,27 +173,14 @@ class ShakespeareLLM(LLM):
     @staticmethod
     def parse_generated_text(raw_text: str) -> List[Dict[str, str]]:
         """
-        Chuyển đổi raw text output của Shakespeare model thành 
-        List[Dict] tương thích với ContinueSceneResponse.
-        
-        Input:
-            [HAMLET] To be or not to be.
-            {He sighs.}
-            
-        Output:
-            [
-                {"character": "HAMLET", "line": "To be or not to be."},
-                {"character": "STAGE_DIRECTION", "line": "He sighs."}
-            ]
+        Chuyển đổi raw text output của Shakespeare model thành JSON list.
         """
         dialogue_list = []
         
-        # Tách dòng, loại bỏ dòng trống
         lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
 
         for line in lines:
             # Case 1: Stage Direction {Action}
-            # Regex bắt: bắt đầu bằng {, kết thúc bằng }, lấy nội dung bên trong
             stage_match = re.match(r'^\{(.*)\}$', line)
             if stage_match:
                 content = stage_match.group(1).strip()
@@ -183,14 +191,11 @@ class ShakespeareLLM(LLM):
                 continue
             
             # Case 2: Dialogue [CHARACTER] Line
-            # Regex bắt: [TÊN] Nội dung
-            # Sử dụng non-greedy matching .*? cho tên nhân vật
             dialogue_match = re.match(r'^\[(.*?)\]\s*(.*)$', line)
             if dialogue_match:
                 char_name = dialogue_match.group(1).strip().upper()
                 speech = dialogue_match.group(2).strip()
                 
-                # Bỏ qua nếu line rỗng
                 if not speech:
                     continue
                     
@@ -199,10 +204,5 @@ class ShakespeareLLM(LLM):
                     "line": speech
                 })
                 continue
-            
-            # Case 3: Dòng không đúng format (hiếm gặp với model instruct tốt)
-            # Có thể bỏ qua hoặc gán vào nhân vật của dòng trước (nếu cần xử lý multiline phức tạp)
-            # Ở đây ta chọn bỏ qua để đảm bảo clean data
-            pass
             
         return dialogue_list

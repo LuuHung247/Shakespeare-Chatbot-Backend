@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     
 
     # Shakespeare Custom Model
-    SHAKESPEARE_MODEL_NAME: str = "Hancovirus/shakespear_Qwen2.5-3B-Instruct"
+    SHAKESPEARE_MODEL_NAME: str = "Hancovirus/shakespear_llama-3.2-3B-Instruct"
     # Alternative: "Hancovirus/shakespear_llama-3.2-3B-Instruct"
     
     # Generation Settings
