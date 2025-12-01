@@ -16,11 +16,8 @@ class LLMManager:
         
     def initialize(self):
         """Khởi tạo LLM dựa trên config"""
-        if self.llm_type == "openai":
-            self.llm = self._init_openai()
-        elif self.llm_type == "anthropic":
-            self.llm = self._init_anthropic()
-        elif self.llm_type == "gemini":
+       
+        if self.llm_type == "gemini":
             self.llm = self._init_gemini()
         # elif self.llm_type == "local":
         #     self.llm = self._init_local()
