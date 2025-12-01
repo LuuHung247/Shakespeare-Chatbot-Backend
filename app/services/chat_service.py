@@ -1,6 +1,7 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, AsyncGenerator
 import json
 import re
+from asyncio import sleep
 
 from app.models.requests import ContinueSceneRequest
 from app.models.responses import ContinueSceneResponse
@@ -10,47 +11,226 @@ from app.config import settings
 from app.llm.custom_shakespeare_llm import ShakespeareLLM
 
 class ChatService:
-    """Service xử lý scene continuation hỗ trợ cả API LLM và Custom Local LLM"""
+    """Service xử lý scene continuation hỗ trợ cả API LLM và Custom Local LLM với Streaming"""
+    
+    async def continue_scene_stream(
+        self, 
+        request: ContinueSceneRequest
+    ) -> AsyncGenerator[str, None]:
+        """
+        Stream scene continuation - yield từng chunk JSON
+        Format: Server-Sent Events (SSE)
+        """
+        try:
+            # 1. Preprocess dialogue
+            dialogue_string = self._preprocess_dialogue(request.previous_dialogue)
+            
+            # 2. Send metadata first
+            yield self._format_sse({
+                "type": "metadata",
+                "data": {
+                    "model_type": settings.LLM_TYPE,
+                    "style": request.style,
+                    "max_lines": request.max_lines,
+                    "temperature": request.temperature
+                }
+            })
+            
+            # 3. PHÂN NHÁNH XỬ LÝ DỰA TRÊN MODEL
+            if settings.LLM_TYPE == "shakespeare":
+                # === STREAM LOCAL SHAKESPEARE MODEL ===
+                async for chunk in self._stream_shakespeare(request, dialogue_string):
+                    yield chunk
+                    
+            elif settings.LLM_TYPE == "gemini":
+                # === STREAM GEMINI ===
+                async for chunk in self._stream_gemini(request, dialogue_string):
+                    yield chunk
+            else:
+                # Fallback cho các model khác
+                async for chunk in self._stream_generic(request, dialogue_string):
+                    yield chunk
+            
+            # 4. Send completion signal
+            yield self._format_sse({
+                "type": "done",
+                "data": {"message": "Generation completed"}
+            })
+            
+        except Exception as e:
+            yield self._format_sse({
+                "type": "error",
+                "data": {"error": str(e)}
+            })
+    
+    async def _stream_shakespeare(
+        self, 
+        request: ContinueSceneRequest, 
+        dialogue_string: str
+    ) -> AsyncGenerator[str, None]:
+        """Stream output từ Shakespeare model"""
+        
+        prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
+        
+        # Buffer để tích lũy text
+        buffer = ""
+        current_dialogue = []
+        
+        # Stream từ model
+        for chunk in llm_manager.stream_shakespeare(prompt):
+            buffer += chunk
+            
+            # Send raw chunk
+            yield self._format_sse({
+                "type": "chunk",
+                "data": {"text": chunk}
+            })
+            
+            # Parse incrementally nếu có đủ pattern
+            parsed_lines = self._try_parse_shakespeare_buffer(buffer)
+            if parsed_lines:
+                for line in parsed_lines:
+                    current_dialogue.append(line)
+                    yield self._format_sse({
+                        "type": "dialogue",
+                        "data": line
+                    })
+        
+        # Final parse
+        final_json = ShakespeareLLM.parse_generated_text(buffer)
+        
+        # Send any remaining unparsed dialogue
+        for item in final_json:
+            if item not in current_dialogue:
+                yield self._format_sse({
+                    "type": "dialogue",
+                    "data": item
+                })
+    
+    async def _stream_gemini(
+        self, 
+        request: ContinueSceneRequest, 
+        dialogue_string: str
+    ) -> AsyncGenerator[str, None]:
+        """Stream output từ Gemini"""
+        
+        prompt = self._build_gemini_prompt(request, dialogue_string)
+        
+        buffer = ""
+        
+        # Stream từ Gemini
+        async for chunk in llm_manager.stream_generate(prompt, temperature=request.temperature):
+            buffer += chunk
+            
+            # Send raw chunk
+            yield self._format_sse({
+                "type": "chunk",
+                "data": {"text": chunk}
+            })
+            
+            # Try parse JSON incrementally
+            parsed = self._try_parse_json_buffer(buffer)
+            if parsed:
+                for item in parsed:
+                    yield self._format_sse({
+                        "type": "dialogue",
+                        "data": item
+                    })
+        
+        # Final validation
+        final_json = self._parse_api_output_to_json(buffer)
+        if self._validate_json(final_json):
+            # Send final complete dialogue if not sent yet
+            yield self._format_sse({
+                "type": "complete_dialogue",
+                "data": final_json
+            })
+    
+    async def _stream_generic(
+        self, 
+        request: ContinueSceneRequest, 
+        dialogue_string: str
+    ) -> AsyncGenerator[str, None]:
+        """Generic streaming cho các model khác"""
+        
+        prompt = self._build_gemini_prompt(request, dialogue_string)
+        
+        async for chunk in llm_manager.stream_generate(prompt):
+            yield self._format_sse({
+                "type": "chunk",
+                "data": {"text": chunk}
+            })
+    
+    # =========================================================================
+    # STREAMING HELPERS
+    # =========================================================================
+    
+    def _format_sse(self, data: dict) -> str:
+        """Format data as Server-Sent Events"""
+        return f"data: {json.dumps(data)}\n\n"
+    
+    def _try_parse_shakespeare_buffer(self, buffer: str) -> List[Dict[str, str]]:
+        """Try to parse Shakespeare format incrementally"""
+        # Tìm complete patterns: [CHARACTER] line hoặc {stage direction}
+        pattern = r'\[([A-Z\s]+)\]\s*([^\[\{]+)|(\{[^\}]+\})'
+        matches = re.finditer(pattern, buffer)
+        
+        result = []
+        for match in matches:
+            if match.group(1):  # Character dialogue
+                result.append({
+                    "character": match.group(1).strip(),
+                    "line": match.group(2).strip()
+                })
+            elif match.group(3):  # Stage direction
+                result.append({
+                    "character": "STAGE_DIRECTION",
+                    "line": match.group(3).strip('{}').strip()
+                })
+        
+        return result
+    
+    def _try_parse_json_buffer(self, buffer: str) -> List[Dict[str, str]]:
+        """Try to parse JSON array incrementally"""
+        # Tìm complete JSON objects trong array
+        try:
+            # Remove markdown if present
+            clean = buffer.strip()
+            if clean.startswith("```"):
+                clean = re.sub(r'```(?:json)?\s*', '', clean)
+            
+            # Try to find complete array
+            if '[' in clean and ']' in clean:
+                start = clean.index('[')
+                end = clean.rindex(']') + 1
+                json_str = clean[start:end]
+                return json.loads(json_str)
+        except:
+            pass
+        
+        return []
+    
+    # =========================================================================
+    # NON-STREAMING METHOD (Kept for backward compatibility)
+    # =========================================================================
     
     async def continue_scene(self, request: ContinueSceneRequest) -> ContinueSceneResponse:
         """
-        Main logic để viết tiếp kịch bản.
+        Main logic để viết tiếp kịch bản (Non-streaming version)
         """
         try:
-            # 1. Preprocess dialogue (list -> string)
             dialogue_string = self._preprocess_dialogue(request.previous_dialogue)
-            
             continuation_json = []
 
-            # 2. PHÂN NHÁNH XỬ LÝ DỰA TRÊN MODEL CONFIG
             if settings.LLM_TYPE == "shakespeare":
-                # === NHÁNH LOCAL SHAKESPEARE MODEL ===
-                
-                # a. Build prompt dành riêng cho model Shakespeare (Dùng header chuẩn của bạn)
-                # Lưu ý: Model custom cần input dạng dict để build prompt, nhưng ở đây ta build string luôn
                 prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
-                
-                # b. Generate Raw Text (Sử dụng hàm generate của manager)
-                # LLM Manager cần hỗ trợ nhận prompt string trực tiếp hoặc ta đóng gói lại nếu cần
-                # Ở đây giả sử ShakespeareLLM.generate_with_stats nhận vào prompt string
                 raw_text, _ = llm_manager.generate_shakespeare_from_string(prompt, print_stream=False)
-                
-                # c. Parse Raw Text -> JSON chuẩn bằng Regex
                 continuation_json = ShakespeareLLM.parse_generated_text(raw_text)
 
             else:
-                # === NHÁNH GEMINI / OPENAI / ANTHROPIC ===
-                
-                # a. Build prompt dạng Instruction (Ép output JSON)
                 prompt = self._build_gemini_prompt(request, dialogue_string)
-                
-                # b. Generate JSON String
                 llm_output = llm_manager.generate(prompt, temperature=request.temperature)
-                
-                # c. Parse JSON String -> JSON Object
                 continuation_json = self._parse_api_output_to_json(llm_output)
-            
-            # 3. XỬ LÝ CHUNG (VALIDATION & RESPONSE)
             
             if not self._validate_json(continuation_json):
                 if not continuation_json:
@@ -86,13 +266,10 @@ class ChatService:
             )
 
     # =========================================================================
-    # 1. PROMPT BUILDERS
+    # PROMPT BUILDERS (unchanged)
     # =========================================================================
 
     def _build_gemini_prompt(self, request: ContinueSceneRequest, dialogue_string: str) -> str:
-        """
-        Prompt dành cho Gemini/OpenAI: Yêu cầu output JSON trực tiếp.
-        """
         characters_info = "\n".join([
             f"- {char.name}: {char.personality} (Emotion: {char.emotion_in_scene})"
             for char in request.scene_context.characters
@@ -132,17 +309,11 @@ Example:
 Return JSON array now:"""
 
     def _build_shakespeare_prompt_structured(self, request: ContinueSceneRequest, dialogue_string: str) -> str:
-        """
-        Prompt dành cho Custom Model: Sử dụng Header gốc mà model đã được train/test tốt.
-        """
-        
-        # 1. Chuẩn bị thông tin nhân vật
         characters_info = "\n".join([
             f"- {char.name}: personality: {char.personality}; emotion: {char.emotion_in_scene}"
             for char in request.scene_context.characters
         ])
 
-        # 2. HEADER GỐC (Giữ nguyên văn theo yêu cầu)
         header = (
             "You are a creative writing assistant and expert playwright in William Shakespeare's style. "
             "You are given INFO (about the characters, their personalities and emotions, the scene summary, "
@@ -165,8 +336,6 @@ Return JSON array now:"""
             "Modern English with sharp, focused, Shakespearean dramatic lines."
         )
 
-        # 3. Construct Body (Tương ứng với phần INFO được nhắc đến trong Header)
-        # Sắp xếp các mục rõ ràng để model dễ tham chiếu
         return f"""{header}
 
 INFO:
@@ -187,11 +356,10 @@ Continue writing from the following text:
 """
 
     # =========================================================================
-    # 2. PARSING & VALIDATION LOGIC
+    # PARSING & VALIDATION (unchanged)
     # =========================================================================
 
     def _parse_api_output_to_json(self, llm_output: str) -> List[Dict[str, str]]:
-        """Parse JSON string từ API (Gemini/OpenAI)"""
         llm_output = llm_output.strip()
         
         if llm_output.startswith("```json"):
@@ -228,10 +396,6 @@ Continue writing from the following text:
         dialogue_json[:] = valid_items
         return len(dialogue_json) > 0
 
-    # =========================================================================
-    # 3. HELPER METHODS
-    # =========================================================================
-
     def _preprocess_dialogue(self, dialogue_input):
         if isinstance(dialogue_input, str):
             return dialogue_preprocessor.clean_dialogue_text(dialogue_input)
@@ -254,5 +418,4 @@ Continue writing from the following text:
         
         return characters_used
 
-# Singleton Instance
 chat_service = ChatService()
