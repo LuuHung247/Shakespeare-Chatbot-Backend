@@ -12,7 +12,8 @@ from app.llm.custom_shakespeare_llm import ShakespeareLLM
 
 class ChatService:
     """Service xử lý scene continuation hỗ trợ cả API LLM và Custom Local LLM với Streaming"""
-    
+    CHUNK_DELAY = 0.05 
+    DIALOGUE_DELAY = 2.0
     async def continue_scene_stream(
         self, 
         request: ContinueSceneRequest
@@ -86,6 +87,7 @@ class ChatService:
                 "data": {"text": chunk}
             })
             
+            await sleep(self.CHUNK_DELAY)
             # Parse incrementally nếu có đủ pattern
             parsed_lines = self._try_parse_shakespeare_buffer(buffer)
             if parsed_lines:
@@ -95,6 +97,7 @@ class ChatService:
                         "type": "dialogue",
                         "data": line
                     })
+                    await sleep(self.DIALOGUE_DELAY)
         
         # Final parse
         final_json = ShakespeareLLM.parse_generated_text(buffer)
@@ -106,6 +109,7 @@ class ChatService:
                     "type": "dialogue",
                     "data": item
                 })
+                await sleep(self.DIALOGUE_DELAY)
     
     async def _stream_gemini(
         self, 
@@ -128,6 +132,7 @@ class ChatService:
                 "data": {"text": chunk}
             })
             
+            await sleep(self.CHUNK_DELAY)
             # Try parse JSON incrementally
             parsed = self._try_parse_json_buffer(buffer)
             if parsed:
@@ -136,6 +141,8 @@ class ChatService:
                         "type": "dialogue",
                         "data": item
                     })
+                    
+                    await sleep(self.DIALOGUE_DELAY)
         
         # Final validation
         final_json = self._parse_api_output_to_json(buffer)
@@ -145,6 +152,8 @@ class ChatService:
                 "type": "complete_dialogue",
                 "data": final_json
             })
+            
+            await sleep(self.DIALOGUE_DELAY)
     
     async def _stream_generic(
         self, 
