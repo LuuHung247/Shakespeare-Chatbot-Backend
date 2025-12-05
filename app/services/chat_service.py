@@ -45,9 +45,29 @@ class ChatService:
     # PRE-COMPILED REGEX PATTERNS
     # =========================================================================
     
-    # Pattern cho Shakespeare format
+    # Pattern cho Shakespeare format - mở rộng để match nhiều variations
     _STAGE_DIRECTION_PATTERN = re.compile(r'^\{(.+)\}$')
-    _DIALOGUE_PATTERN = re.compile(r'^\[([A-Z][A-Z\s]*)\]\s*(.+)$')
+    
+    # Match: [CHAR], [CHAR], [CHAR.], [CHAR:], [CHAR, [aside]], etc.
+    _DIALOGUE_PATTERN = re.compile(
+        r'^\[([A-Z][A-Z\s\.\,\:]*?)(?:\]|\,\s*\[)'  # Character name (stop at ] or , [)
+        r'.*?\]?\s*'                                  # Optional nested bracket content
+        r'(.*)$'                                      # Rest is speech
+    )
+    
+    # Simpler fallback pattern
+    _DIALOGUE_PATTERN_SIMPLE = re.compile(r'^\[([^\]]+)\]\s*(.*)$')
+    
+    # Pattern để clean character name
+    _CHAR_NAME_CLEANUP = re.compile(r'[\.\,\:\s\[\]]+$')  # Remove trailing punctuation
+    _CHAR_NAME_CLEANUP_START = re.compile(r'^[\.\,\:\s]+')  # Remove leading punctuation
+    _CHAR_NAME_NORMALIZE = re.compile(r'\s+')  # Normalize multiple spaces
+    
+    # Pattern để extract embedded stage directions từ dialogue
+    _EMBEDDED_STAGE_DIRECTION = re.compile(r'\[([A-Za-z]+\.?)\]')  # [Dies], [Exit.], etc.
+    
+    # Pattern để clean speech - remove leading punctuation
+    _SPEECH_CLEANUP = re.compile(r'^[\.\,\:\s\]\[]+')  # Include ] and [
     
     # Pattern cho JSON cleanup
     _MARKDOWN_PATTERN = re.compile(r'```(?:json)?\s*')
@@ -126,17 +146,26 @@ class ChatService:
         - StringIO buffer thay vì string += 
         - Pre-compiled regex
         - Set với frozenset keys cho O(1) lookup
+        - Filter empty chunks
+        - Clean character names
         """
         prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
         
+        # Get valid character names from request
+        valid_characters = {char.name.upper() for char in request.scene_context.characters}
+        valid_characters.add("STAGE_DIRECTION")
+        
         # StringIO buffer - hiệu quả hơn string concatenation
         buffer = StringIO()
-        buffer_pos = 0  # Track read position
         last_parsed_end = 0
         sent_dialogues: Set[Tuple[str, str]] = set()
         
         # Stream từ model
         for chunk in llm_manager.stream_shakespeare(prompt):
+            # Skip empty chunks
+            if not chunk or not chunk.strip():
+                continue
+                
             # Write to buffer (O(1) amortized)
             buffer.write(chunk)
             
@@ -150,10 +179,11 @@ class ChatService:
             current_content = buffer.getvalue()
             
             # Parse incremental
-            new_dialogues, new_end = self._parse_shakespeare_incremental(
+            new_dialogues, new_end = self._parse_shakespeare_incremental_optimized(
                 current_content, 
                 last_parsed_end,
-                sent_dialogues
+                sent_dialogues,
+                valid_characters
             )
             
             # Gửi các dialogue mới
@@ -169,10 +199,11 @@ class ChatService:
         
         # Final parse
         final_content = buffer.getvalue()
-        remaining_dialogues = self._parse_shakespeare_remaining(
+        remaining_dialogues = self._parse_shakespeare_remaining_optimized(
             final_content, 
             last_parsed_end, 
-            sent_dialogues
+            sent_dialogues,
+            valid_characters
         )
         
         for dialogue in remaining_dialogues:
@@ -184,14 +215,21 @@ class ChatService:
         # Cleanup
         buffer.close()
     
-    def _parse_shakespeare_incremental(
+    def _parse_shakespeare_incremental_optimized(
         self, 
         buffer: str, 
         start_pos: int,
-        already_sent: Set[Tuple[str, str]]
+        already_sent: Set[Tuple[str, str]],
+        valid_characters: Set[str] = None
     ) -> Tuple[List[Dict[str, str]], int]:
         """
         Optimized incremental parsing với pre-compiled regex.
+        
+        Improvements:
+        - Clean character names (remove dots, normalize spaces)
+        - Validate against known characters
+        - Extract embedded stage directions
+        - Handle malformed speaker tags
         """
         last_newline = buffer.rfind('\n')
         if last_newline <= start_pos:
@@ -222,10 +260,39 @@ class ChatService:
                 continue
             
             # Character dialogue - dùng pre-compiled pattern
-            dialogue_match = self._DIALOGUE_PATTERN.match(line)
+            dialogue_match = self._DIALOGUE_PATTERN_SIMPLE.match(line)
             if dialogue_match:
-                char_name = dialogue_match.group(1).strip().upper()
+                raw_char_name = dialogue_match.group(1).strip()
                 speech = dialogue_match.group(2).strip()
+                
+                # Clean character name
+                char_name = self._clean_character_name(raw_char_name)
+                
+                # Clean speech - remove leading : or .
+                speech = self._clean_speech(speech)
+                
+                # Skip if no valid speech
+                if not char_name or not speech:
+                    continue
+                
+                # Check for multiple speakers on one line (e.g., "[HORATIO], [GHOST]")
+                if '[' in speech:
+                    # Có thể có speaker khác trong line, skip phần sau
+                    bracket_pos = speech.find('[')
+                    speech = speech[:bracket_pos].strip().rstrip(',')
+                    speech = self._clean_speech(speech)
+                    if not speech:
+                        continue
+                
+                # Extract embedded stage directions like [Dies], [Exit]
+                speech, embedded_directions = self._extract_embedded_directions(speech)
+                speech = self._clean_speech(speech)  # Clean again after extraction
+                
+                # Validate character if we have a valid list
+                if valid_characters and char_name not in valid_characters:
+                    # Try fuzzy match (e.g., HAMLOT -> HAMLET)
+                    char_name = self._fuzzy_match_character(char_name, valid_characters)
+                
                 if char_name and speech:
                     key = (char_name, speech)
                     if key not in already_sent:
@@ -233,16 +300,137 @@ class ChatService:
                             "character": char_name,
                             "line": speech
                         })
+                
+                # Add embedded directions as separate entries
+                for direction in embedded_directions:
+                    dir_key = ("STAGE_DIRECTION", direction)
+                    if dir_key not in already_sent:
+                        results.append({
+                            "character": "STAGE_DIRECTION",
+                            "line": direction
+                        })
         
         return results, last_newline + 1
     
-    def _parse_shakespeare_remaining(
+    def _clean_character_name(self, name: str) -> str:
+        """Clean và normalize character name"""
+        if not name:
+            return ""
+        
+        # Remove nested content like "[to the Ghost]"
+        # [HAMLET, [to the Ghost]] → HAMLET
+        if ',' in name and '[' in name:
+            name = name.split(',')[0]
+        
+        # Remove trailing punctuation (., :, spaces, brackets)
+        name = self._CHAR_NAME_CLEANUP.sub('', name)
+        
+        # Remove leading punctuation
+        name = self._CHAR_NAME_CLEANUP_START.sub('', name)
+        
+        # Normalize spaces (HAM LET -> HAMLET, G HOST -> GHOST)
+        name = self._CHAR_NAME_NORMALIZE.sub('', name)
+        
+        return name.upper().strip()
+    
+    def _clean_speech(self, speech: str) -> str:
+        """Clean speech - remove leading punctuation like : or ."""
+        if not speech:
+            return ""
+        
+        # Remove leading punctuation and whitespace
+        speech = self._SPEECH_CLEANUP.sub('', speech)
+        
+        return speech.strip()
+    
+    def _extract_embedded_directions(self, speech: str) -> Tuple[str, List[str]]:
+        """Extract [Dies], [Exit], etc. from speech"""
+        directions = []
+        
+        # Find patterns like [Dies], [Exit], [Aside]
+        matches = self._EMBEDDED_STAGE_DIRECTION.findall(speech)
+        for match in matches:
+            # Only treat as direction if it looks like one
+            if match.lower() in ('dies', 'exit', 'exits', 'aside', 'within', 'aloud', 'reads', 'sings'):
+                directions.append(match.capitalize())
+        
+        # Remove the directions from speech
+        cleaned_speech = self._EMBEDDED_STAGE_DIRECTION.sub('', speech).strip()
+        # Clean up extra whitespace and punctuation
+        cleaned_speech = re.sub(r'\s+', ' ', cleaned_speech).strip()
+        cleaned_speech = cleaned_speech.rstrip('\t ')
+        
+        return cleaned_speech, directions
+    
+    def _fuzzy_match_character(self, name: str, valid_characters: Set[str]) -> str:
+        """Fuzzy match typos in character names"""
+        if not name:
+            return None
+            
+        # Already valid
+        if name in valid_characters:
+            return name
+        
+        # Common typos map
+        typo_map = {
+            # Hamlet variations
+            'HAMLOT': 'HAMLET',
+            'HAMELT': 'HAMLET',
+            'HAMLETTE': 'HAMLET',
+            'HAMLETT': 'HAMLET',
+            'HMALET': 'HAMLET',
+            'HALMET': 'HAMLET',
+            # Horatio variations
+            'HORATOI': 'HORATIO',
+            'HORAITO': 'HORATIO',
+            'HORTAIO': 'HORATIO',
+            'HORATO': 'HORATIO',
+            # Ghost variations
+            'GOHST': 'GHOST',
+            'GOSHT': 'GHOST',
+            'GOST': 'GHOST',
+            # Other common
+            'QUENE': 'QUEEN',
+            'QEEN': 'QUEEN',
+            'KINGG': 'KING',
+        }
+        
+        if name in typo_map and typo_map[name] in valid_characters:
+            return typo_map[name]
+        
+        # Try removing common suffixes/prefixes that model adds
+        cleaned = name.rstrip('S').rstrip('E')  # HAMLETS -> HAMLET
+        if cleaned in valid_characters:
+            return cleaned
+        
+        # Try prefix match (for truncated names)
+        for valid in valid_characters:
+            if valid == "STAGE_DIRECTION":
+                continue
+            # Exact prefix match (at least 4 chars)
+            if len(name) >= 4 and (valid.startswith(name) or name.startswith(valid)):
+                return valid
+        
+        # Try Levenshtein-like simple match (1 char difference)
+        for valid in valid_characters:
+            if valid == "STAGE_DIRECTION":
+                continue
+            if len(name) == len(valid):
+                diff = sum(1 for a, b in zip(name, valid) if a != b)
+                if diff <= 1:  # Allow 1 character difference
+                    return valid
+        
+        # Return None to filter out unknown characters
+        return None
+    
+    def _parse_shakespeare_remaining_optimized(
         self, 
         buffer: str, 
         start_pos: int,
-        already_sent: Set[Tuple[str, str]]
+        already_sent: Set[Tuple[str, str]],
+        valid_characters: Set[str] = None
     ) -> List[Dict[str, str]]:
-        """Parse phần còn lại với pre-compiled regex."""
+        """Parse phần còn lại với pre-compiled regex và character validation."""
         remaining = buffer[start_pos:].strip()
         if not remaining:
             return []
@@ -260,21 +448,49 @@ class ChatService:
                 })
             return results
         
-        # Character dialogue
-        dialogue_match = self._DIALOGUE_PATTERN.match(remaining)
+        # Character dialogue - use simple pattern
+        dialogue_match = self._DIALOGUE_PATTERN_SIMPLE.match(remaining)
         if dialogue_match:
-            char_name = dialogue_match.group(1).strip().upper()
+            raw_char_name = dialogue_match.group(1).strip()
             speech = dialogue_match.group(2).strip()
+            
+            # Clean character name
+            char_name = self._clean_character_name(raw_char_name)
+            
+            # Clean speech
+            speech = self._clean_speech(speech)
+            
+            # Handle multiple speakers
+            if '[' in speech:
+                bracket_pos = speech.find('[')
+                speech = speech[:bracket_pos].strip().rstrip(',')
+                speech = self._clean_speech(speech)
+            
+            # Extract embedded directions
+            speech, embedded_directions = self._extract_embedded_directions(speech)
+            speech = self._clean_speech(speech)
+            
+            # Fuzzy match character
+            if valid_characters and char_name not in valid_characters:
+                char_name = self._fuzzy_match_character(char_name, valid_characters)
+            
             if char_name and speech and (char_name, speech) not in already_sent:
                 results.append({
                     "character": char_name,
                     "line": speech
                 })
+            
+            for direction in embedded_directions:
+                if ("STAGE_DIRECTION", direction) not in already_sent:
+                    results.append({
+                        "character": "STAGE_DIRECTION",
+                        "line": direction
+                    })
         
         return results
     
     # =========================================================================
-    # GEMINI STREAMING 
+    # GEMINI STREAMING (unchanged logic, optimized serialization)
     # =========================================================================
     
     async def _stream_gemini(
@@ -297,7 +513,7 @@ class ChatService:
                 "data": {"text": chunk}
             })
         
-            parsed = self._try_parse_json_buffer(buffer.getvalue())
+            parsed = self._try_parse_json_buffer_optimized(buffer.getvalue())
             if parsed:
                 for item in parsed:
                     yield self._format_sse({
@@ -338,7 +554,7 @@ class ChatService:
         """Format SSE với orjson (nếu có)"""
         return self._SSE_TEMPLATE.format(json_dumps(data))
     
-    def _try_parse_json_buffer(self, buffer: str) -> List[Dict[str, str]]:
+    def _try_parse_json_buffer_optimized(self, buffer: str) -> List[Dict[str, str]]:
         """Parse JSON với pre-compiled regex và orjson"""
         try:
             clean = buffer.strip()
@@ -407,7 +623,7 @@ class ChatService:
             )
 
     # =========================================================================
-    # PROMPT BUILDERS 
+    # PROMPT BUILDERS (unchanged)
     # =========================================================================
 
     def _build_gemini_prompt(self, request: ContinueSceneRequest, dialogue_string: str) -> str:
