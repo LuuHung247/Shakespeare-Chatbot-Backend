@@ -6,14 +6,25 @@ import threading
 import time
 import re
 
-
 class ShakespeareLLM(LLM):
-    """Custom LLM wrapper cho Shakespeare model với streaming và parsing support"""
+    """
+    Custom LLM wrapper cho Shakespeare model với streaming và parsing support.
+    
+    Features:
+    - 4-bit quantization cho GPU nhỏ (4GB VRAM)
+    - Streaming generation
+    - Anti-repetition với repetition_penalty và no_repeat_ngram_size
+    - Text parsing cho Shakespeare format
+    """
     
     model_name: str = "Hancovirus/shakespear_Qwen2.5-3B-Instruct"
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
+    
+    # Anti-repetition parameters
+    repetition_penalty: float = 1.1  # >1.0 để phạt lặp token
+    no_repeat_ngram_size: int = 4    # Cấm lặp n-gram size n
     
     tokenizer: Any = None
     model: Any = None
@@ -28,6 +39,8 @@ class ShakespeareLLM(LLM):
         max_new_tokens = kwargs.pop('max_new_tokens', 512)
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
+        repetition_penalty = kwargs.pop('repetition_penalty', 1.1)
+        no_repeat_ngram_size = kwargs.pop('no_repeat_ngram_size', 4)
         
         super().__init__(**kwargs)
         
@@ -35,6 +48,8 @@ class ShakespeareLLM(LLM):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
         self.tokenizer = None
         self.model = None
         
@@ -65,6 +80,8 @@ class ShakespeareLLM(LLM):
                     trust_remote_code=True,
                 )
                 print(f"Model loaded successfully on GPU (4-bit quantized)")
+                print(f"  → repetition_penalty: {self.repetition_penalty}")
+                print(f"  → no_repeat_ngram_size: {self.no_repeat_ngram_size}")
             
             except Exception as e:
                 print(f"Warning: GPU loading failed ({e}). Falling back to CPU.")
@@ -89,7 +106,34 @@ class ShakespeareLLM(LLM):
             "max_new_tokens": self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "repetition_penalty": self.repetition_penalty,
+            "no_repeat_ngram_size": self.no_repeat_ngram_size,
         }
+    
+    def _build_generation_kwargs(
+        self, 
+        inputs: Dict[str, Any],
+        streamer: Optional[TextIteratorStreamer] = None,
+        **overrides
+    ) -> Dict[str, Any]:
+        """
+        Build generation kwargs với tất cả parameters.
+        Tránh duplicate code giữa các methods.
+        """
+        gen_kwargs = {
+            **inputs,
+            "max_new_tokens": overrides.get("max_new_tokens", self.max_new_tokens),
+            "do_sample": True,
+            "temperature": overrides.get("temperature", self.temperature),
+            "top_p": overrides.get("top_p", self.top_p),
+            "repetition_penalty": overrides.get("repetition_penalty", self.repetition_penalty),
+            "no_repeat_ngram_size": overrides.get("no_repeat_ngram_size", self.no_repeat_ngram_size),
+        }
+        
+        if streamer is not None:
+            gen_kwargs["streamer"] = streamer
+            
+        return gen_kwargs
     
     def _call(
         self,
@@ -109,16 +153,16 @@ class ShakespeareLLM(LLM):
     def stream_generate(
         self, 
         prompt: str,
-        stop_sequences: Optional[List[str]] = None
+        stop_sequences: Optional[List[str]] = None,
+        **kwargs
     ) -> Generator[str, None, None]:
         """
         Stream generation - yields text chunks as they're generated.
         
-        This is the method called by LLMManager.stream_shakespeare()
-        
         Args:
             prompt: Input prompt
             stop_sequences: Optional list of sequences to stop generation
+            **kwargs: Override generation params (temperature, repetition_penalty, etc.)
             
         Yields:
             Text chunks as they're generated
@@ -134,14 +178,8 @@ class ShakespeareLLM(LLM):
             skip_special_tokens=True,
         )
         
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            streamer=streamer,
-        )
+        # Build generation kwargs với anti-repetition
+        gen_kwargs = self._build_generation_kwargs(inputs, streamer, **kwargs)
         
         # Run model in separate thread
         thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
@@ -159,14 +197,15 @@ class ShakespeareLLM(LLM):
             thread.join(timeout=1.0)
     
     # =========================================================================
-    # INTERNAL GENERATION (Original)
+    # INTERNAL GENERATION
     # =========================================================================
     
     def _generate_internal(
         self, 
         prompt: str, 
         print_stream: bool = False,
-        stop_sequences: Optional[List[str]] = None
+        stop_sequences: Optional[List[str]] = None,
+        **kwargs
     ) -> tuple[str, dict]:
         """Core generation logic với streaming - collects full output"""
         # Tokenize prompt
@@ -180,14 +219,8 @@ class ShakespeareLLM(LLM):
             skip_special_tokens=True,
         )
         
-        gen_kwargs = dict(
-            **inputs,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            streamer=streamer,
-        )
+        # Build generation kwargs với anti-repetition
+        gen_kwargs = self._build_generation_kwargs(inputs, streamer, **kwargs)
         
         # Chạy model trong thread riêng để stream output
         thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
@@ -201,7 +234,7 @@ class ShakespeareLLM(LLM):
                 print(new_text, end="", flush=True)
             generated_parts.append(new_text)
             
-            # Stop sequence check cơ bản
+            # Stop sequence check
             if stop_sequences and any(s in new_text for s in stop_sequences):
                 break
         
@@ -214,7 +247,7 @@ class ShakespeareLLM(LLM):
         # Tính toán thống kê
         num_new_tokens = 0
         if continuation.strip():
-            num_new_tokens = len(self.tokenizer.encode(continuation))
+            num_new_tokens = len(self.tokenizer.encode(continuation, add_special_tokens=False))
             
         stats = {
             "num_input_tokens": num_input_tokens,
@@ -231,13 +264,20 @@ class ShakespeareLLM(LLM):
         return self._generate_internal(prompt, print_stream=print_stream)
 
     # =========================================================================
-    # PARSING (Original)
+    # PARSING
     # =========================================================================
     
     @staticmethod
     def parse_generated_text(raw_text: str) -> List[Dict[str, str]]:
         """
         Chuyển đổi raw text output của Shakespeare model thành JSON list.
+        
+        Format expected:
+        - [CHARACTER] Dialogue line
+        - {Stage direction}
+        
+        Returns:
+            List of dicts with 'character' and 'line' keys
         """
         dialogue_list = []
         
@@ -248,10 +288,11 @@ class ShakespeareLLM(LLM):
             stage_match = re.match(r'^\{(.*)\}$', line)
             if stage_match:
                 content = stage_match.group(1).strip()
-                dialogue_list.append({
-                    "character": "STAGE_DIRECTION",
-                    "line": content
-                })
+                if content:
+                    dialogue_list.append({
+                        "character": "STAGE_DIRECTION",
+                        "line": content
+                    })
                 continue
             
             # Case 2: Dialogue [CHARACTER] Line
