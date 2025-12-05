@@ -1,22 +1,6 @@
 from typing import List, Dict, Any, AsyncGenerator, Set, Tuple
-from io import StringIO
+import json
 import re
-
-# Sử dụng orjson nếu có (nhanh hơn 3-10x), fallback về json
-try:
-    import orjson
-    def json_dumps(data: dict) -> str:
-        return orjson.dumps(data).decode('utf-8')
-    def json_loads(data: str) -> Any:
-        return orjson.loads(data)
-    JSON_LIB = "orjson"
-except ImportError:
-    import json
-    def json_dumps(data: dict) -> str:
-        return json.dumps(data, ensure_ascii=False)
-    def json_loads(data: str) -> Any:
-        return json.loads(data)
-    JSON_LIB = "json"
 
 from app.models.requests import ContinueSceneRequest
 from app.models.responses import ContinueSceneResponse
@@ -27,61 +11,10 @@ from app.llm.custom_shakespeare_llm import ShakespeareLLM
 
 
 class ChatService:
-    """
-    Optimized Service xử lý scene continuation.
-    
-    Optimizations:
-    - Pre-compiled regex patterns
-    - orjson for faster JSON serialization (if available)
-    - StringIO buffer thay vì string concatenation
-    - Reduced function call overhead
-    - Cached character set lookup
-    """
+    """Service xử lý scene continuation hỗ trợ cả API LLM và Custom Local LLM với Streaming"""
     
     # Chỉ giữ delay cho Gemini (backward compatibility)
     DIALOGUE_DELAY = 2.0
-    
-    # =========================================================================
-    # PRE-COMPILED REGEX PATTERNS
-    # =========================================================================
-    
-    # Pattern cho Shakespeare format - mở rộng để match nhiều variations
-    _STAGE_DIRECTION_PATTERN = re.compile(r'^\{(.+)\}$')
-    
-    # Match: [CHAR], [CHAR], [CHAR.], [CHAR:], [CHAR, [aside]], etc.
-    _DIALOGUE_PATTERN = re.compile(
-        r'^\[([A-Z][A-Z\s\.\,\:]*?)(?:\]|\,\s*\[)'  # Character name (stop at ] or , [)
-        r'.*?\]?\s*'                                  # Optional nested bracket content
-        r'(.*)$'                                      # Rest is speech
-    )
-    
-    # Simpler fallback pattern
-    _DIALOGUE_PATTERN_SIMPLE = re.compile(r'^\[([^\]]+)\]\s*(.*)$')
-    
-    # Pattern để clean character name
-    _CHAR_NAME_CLEANUP = re.compile(r'[\.\,\:\s\[\]]+$')  # Remove trailing punctuation
-    _CHAR_NAME_CLEANUP_START = re.compile(r'^[\.\,\:\s]+')  # Remove leading punctuation
-    _CHAR_NAME_NORMALIZE = re.compile(r'\s+')  # Normalize multiple spaces
-    
-    # Pattern để extract embedded stage directions từ dialogue
-    _EMBEDDED_STAGE_DIRECTION = re.compile(r'\[([A-Za-z]+\.?)\]')  # [Dies], [Exit.], etc.
-    
-    # Pattern để clean speech - remove leading punctuation
-    _SPEECH_CLEANUP = re.compile(r'^[\.\,\:\s\]\[]+')  # Include ] and [
-    
-    # Pattern cho JSON cleanup
-    _MARKDOWN_PATTERN = re.compile(r'```(?:json)?\s*')
-    
-    # SSE format template (avoid f-string overhead)
-    _SSE_TEMPLATE = "data: {}\n\n"
-    
-    def __init__(self):
-        """Initialize với logging về JSON library đang dùng"""
-        print(f"ChatService initialized with {JSON_LIB} for JSON serialization")
-    
-    # =========================================================================
-    # STREAMING ENTRY POINT
-    # =========================================================================
     
     async def continue_scene_stream(
         self, 
@@ -106,15 +39,18 @@ class ChatService:
                 }
             })
             
-            # 3. Route to appropriate handler
+            # 3. PHÂN NHÁNH XỬ LÝ DỰA TRÊN MODEL
             if settings.LLM_TYPE == "shakespeare":
+                # === STREAM LOCAL SHAKESPEARE MODEL (OPTIMIZED) ===
                 async for chunk in self._stream_shakespeare(request, dialogue_string):
                     yield chunk
                     
             elif settings.LLM_TYPE == "gemini":
+                # === STREAM GEMINI (unchanged) ===
                 async for chunk in self._stream_gemini(request, dialogue_string):
                     yield chunk
             else:
+                # Fallback cho các model khác
                 async for chunk in self._stream_generic(request, dialogue_string):
                     yield chunk
             
@@ -142,32 +78,21 @@ class ChatService:
         """
         Optimized streaming cho Shakespeare model.
         
-        Uses:
-        - StringIO buffer thay vì string += 
-        - Pre-compiled regex
-        - Set với frozenset keys cho O(1) lookup
-        - Filter empty chunks
-        - Clean character names
+        Tối ưu:
+        - Incremental parsing chỉ phần mới của buffer
+        - Track dialogues đã gửi bằng Set (O(1) lookup)
+        - Không có artificial delays
+        - Không parse lại toàn bộ buffer ở cuối
         """
         prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
         
-        # Get valid character names from request
-        valid_characters = {char.name.upper() for char in request.scene_context.characters}
-        valid_characters.add("STAGE_DIRECTION")
-        
-        # StringIO buffer - hiệu quả hơn string concatenation
-        buffer = StringIO()
-        last_parsed_end = 0
-        sent_dialogues: Set[Tuple[str, str]] = set()
+        buffer = ""
+        last_parsed_end = 0  # Track vị trí đã parse
+        sent_dialogues: Set[Tuple[str, str]] = set()  # (character, line) đã gửi
         
         # Stream từ model
         for chunk in llm_manager.stream_shakespeare(prompt):
-            # Skip empty chunks
-            if not chunk or not chunk.strip():
-                continue
-                
-            # Write to buffer (O(1) amortized)
-            buffer.write(chunk)
+            buffer += chunk
             
             # Gửi raw chunk ngay lập tức
             yield self._format_sse({
@@ -175,262 +100,117 @@ class ChatService:
                 "data": {"text": chunk}
             })
             
-            # Get current buffer content for parsing
-            current_content = buffer.getvalue()
-            
-            # Parse incremental
-            new_dialogues, new_end = self._parse_shakespeare_incremental_optimized(
-                current_content, 
+            # Parse incremental - chỉ từ vị trí an toàn
+            new_dialogues, new_end = self._parse_shakespeare_incremental(
+                buffer, 
                 last_parsed_end,
-                sent_dialogues,
-                valid_characters
+                sent_dialogues
             )
             
             # Gửi các dialogue mới
             for dialogue in new_dialogues:
-                sent_dialogues.add((dialogue["character"], dialogue["line"]))
+                dialogue_key = (dialogue["character"], dialogue["line"])
+                if dialogue_key not in sent_dialogues:
+                    sent_dialogues.add(dialogue_key)
+                    yield self._format_sse({
+                        "type": "dialogue",
+                        "data": dialogue
+                    })
+            
+            # Update position
+            if new_end > last_parsed_end:
+                last_parsed_end = new_end
+        
+        # Final parse cho phần còn lại (nếu có incomplete line ở cuối)
+        remaining_dialogues = self._parse_shakespeare_remaining(
+            buffer, 
+            last_parsed_end, 
+            sent_dialogues
+        )
+        
+        for dialogue in remaining_dialogues:
+            dialogue_key = (dialogue["character"], dialogue["line"])
+            if dialogue_key not in sent_dialogues:
+                sent_dialogues.add(dialogue_key)
                 yield self._format_sse({
                     "type": "dialogue",
                     "data": dialogue
                 })
-            
-            if new_end > last_parsed_end:
-                last_parsed_end = new_end
-        
-        # Final parse
-        final_content = buffer.getvalue()
-        remaining_dialogues = self._parse_shakespeare_remaining_optimized(
-            final_content, 
-            last_parsed_end, 
-            sent_dialogues,
-            valid_characters
-        )
-        
-        for dialogue in remaining_dialogues:
-            yield self._format_sse({
-                "type": "dialogue",
-                "data": dialogue
-            })
-        
-        # Cleanup
-        buffer.close()
     
-    def _parse_shakespeare_incremental_optimized(
+    def _parse_shakespeare_incremental(
         self, 
         buffer: str, 
         start_pos: int,
-        already_sent: Set[Tuple[str, str]],
-        valid_characters: Set[str] = None
+        already_sent: Set[Tuple[str, str]]
     ) -> Tuple[List[Dict[str, str]], int]:
         """
-        Optimized incremental parsing với pre-compiled regex.
+        Parse Shakespeare format từ vị trí start_pos.
+        Chỉ parse các lines HOÀN CHỈNH (kết thúc bằng newline).
         
-        Improvements:
-        - Clean character names (remove dots, normalize spaces)
-        - Validate against known characters
-        - Extract embedded stage directions
-        - Handle malformed speaker tags
+        Returns:
+            - List dialogues mới tìm được
+            - Vị trí end position an toàn để tiếp tục parse
         """
+        # Tìm vị trí newline cuối cùng - chỉ parse đến đó
         last_newline = buffer.rfind('\n')
         if last_newline <= start_pos:
+            # Chưa có line hoàn chỉnh mới
             return [], start_pos
         
-        # Parse segment
+        # Lùi lại một chút từ start_pos để không miss partial match
         safe_start = max(0, start_pos - 100)
         parse_segment = buffer[safe_start:last_newline + 1]
         
         results = []
         
-        for line in parse_segment.split('\n'):
+        # Pattern cho complete lines
+        # [CHARACTER] dialogue text
+        # {stage direction}
+        lines = parse_segment.split('\n')
+        
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
             
-            # Stage direction - dùng pre-compiled pattern
-            stage_match = self._STAGE_DIRECTION_PATTERN.match(line)
+            # Stage direction: {action}
+            stage_match = re.match(r'^\{(.+)\}$', line)
             if stage_match:
                 content = stage_match.group(1).strip()
                 if content:
-                    key = ("STAGE_DIRECTION", content)
-                    if key not in already_sent:
-                        results.append({
-                            "character": "STAGE_DIRECTION",
-                            "line": content
-                        })
+                    dialogue = {
+                        "character": "STAGE_DIRECTION",
+                        "line": content
+                    }
+                    if (dialogue["character"], dialogue["line"]) not in already_sent:
+                        results.append(dialogue)
                 continue
             
-            # Character dialogue - dùng pre-compiled pattern
-            dialogue_match = self._DIALOGUE_PATTERN_SIMPLE.match(line)
+            # Character dialogue: [CHARACTER] text
+            dialogue_match = re.match(r'^\[([A-Z][A-Z\s]*)\]\s*(.+)$', line)
             if dialogue_match:
-                raw_char_name = dialogue_match.group(1).strip()
+                char_name = dialogue_match.group(1).strip().upper()
                 speech = dialogue_match.group(2).strip()
-                
-                # Clean character name
-                char_name = self._clean_character_name(raw_char_name)
-                
-                # Clean speech - remove leading : or .
-                speech = self._clean_speech(speech)
-                
-                # Skip if no valid speech
-                if not char_name or not speech:
-                    continue
-                
-                # Check for multiple speakers on one line (e.g., "[HORATIO], [GHOST]")
-                if '[' in speech:
-                    # Có thể có speaker khác trong line, skip phần sau
-                    bracket_pos = speech.find('[')
-                    speech = speech[:bracket_pos].strip().rstrip(',')
-                    speech = self._clean_speech(speech)
-                    if not speech:
-                        continue
-                
-                # Extract embedded stage directions like [Dies], [Exit]
-                speech, embedded_directions = self._extract_embedded_directions(speech)
-                speech = self._clean_speech(speech)  # Clean again after extraction
-                
-                # Validate character if we have a valid list
-                if valid_characters and char_name not in valid_characters:
-                    # Try fuzzy match (e.g., HAMLOT -> HAMLET)
-                    char_name = self._fuzzy_match_character(char_name, valid_characters)
-                
                 if char_name and speech:
-                    key = (char_name, speech)
-                    if key not in already_sent:
-                        results.append({
-                            "character": char_name,
-                            "line": speech
-                        })
-                
-                # Add embedded directions as separate entries
-                for direction in embedded_directions:
-                    dir_key = ("STAGE_DIRECTION", direction)
-                    if dir_key not in already_sent:
-                        results.append({
-                            "character": "STAGE_DIRECTION",
-                            "line": direction
-                        })
+                    dialogue = {
+                        "character": char_name,
+                        "line": speech
+                    }
+                    if (dialogue["character"], dialogue["line"]) not in already_sent:
+                        results.append(dialogue)
         
         return results, last_newline + 1
     
-    def _clean_character_name(self, name: str) -> str:
-        """Clean và normalize character name"""
-        if not name:
-            return ""
-        
-        # Remove nested content like "[to the Ghost]"
-        # [HAMLET, [to the Ghost]] → HAMLET
-        if ',' in name and '[' in name:
-            name = name.split(',')[0]
-        
-        # Remove trailing punctuation (., :, spaces, brackets)
-        name = self._CHAR_NAME_CLEANUP.sub('', name)
-        
-        # Remove leading punctuation
-        name = self._CHAR_NAME_CLEANUP_START.sub('', name)
-        
-        # Normalize spaces (HAM LET -> HAMLET, G HOST -> GHOST)
-        name = self._CHAR_NAME_NORMALIZE.sub('', name)
-        
-        return name.upper().strip()
-    
-    def _clean_speech(self, speech: str) -> str:
-        """Clean speech - remove leading punctuation like : or ."""
-        if not speech:
-            return ""
-        
-        # Remove leading punctuation and whitespace
-        speech = self._SPEECH_CLEANUP.sub('', speech)
-        
-        return speech.strip()
-    
-    def _extract_embedded_directions(self, speech: str) -> Tuple[str, List[str]]:
-        """Extract [Dies], [Exit], etc. from speech"""
-        directions = []
-        
-        # Find patterns like [Dies], [Exit], [Aside]
-        matches = self._EMBEDDED_STAGE_DIRECTION.findall(speech)
-        for match in matches:
-            # Only treat as direction if it looks like one
-            if match.lower() in ('dies', 'exit', 'exits', 'aside', 'within', 'aloud', 'reads', 'sings'):
-                directions.append(match.capitalize())
-        
-        # Remove the directions from speech
-        cleaned_speech = self._EMBEDDED_STAGE_DIRECTION.sub('', speech).strip()
-        # Clean up extra whitespace and punctuation
-        cleaned_speech = re.sub(r'\s+', ' ', cleaned_speech).strip()
-        cleaned_speech = cleaned_speech.rstrip('\t ')
-        
-        return cleaned_speech, directions
-    
-    def _fuzzy_match_character(self, name: str, valid_characters: Set[str]) -> str:
-        """Fuzzy match typos in character names"""
-        if not name:
-            return None
-            
-        # Already valid
-        if name in valid_characters:
-            return name
-        
-        # Common typos map
-        typo_map = {
-            # Hamlet variations
-            'HAMLOT': 'HAMLET',
-            'HAMELT': 'HAMLET',
-            'HAMLETTE': 'HAMLET',
-            'HAMLETT': 'HAMLET',
-            'HMALET': 'HAMLET',
-            'HALMET': 'HAMLET',
-            # Horatio variations
-            'HORATOI': 'HORATIO',
-            'HORAITO': 'HORATIO',
-            'HORTAIO': 'HORATIO',
-            'HORATO': 'HORATIO',
-            # Ghost variations
-            'GOHST': 'GHOST',
-            'GOSHT': 'GHOST',
-            'GOST': 'GHOST',
-            # Other common
-            'QUENE': 'QUEEN',
-            'QEEN': 'QUEEN',
-            'KINGG': 'KING',
-        }
-        
-        if name in typo_map and typo_map[name] in valid_characters:
-            return typo_map[name]
-        
-        # Try removing common suffixes/prefixes that model adds
-        cleaned = name.rstrip('S').rstrip('E')  # HAMLETS -> HAMLET
-        if cleaned in valid_characters:
-            return cleaned
-        
-        # Try prefix match (for truncated names)
-        for valid in valid_characters:
-            if valid == "STAGE_DIRECTION":
-                continue
-            # Exact prefix match (at least 4 chars)
-            if len(name) >= 4 and (valid.startswith(name) or name.startswith(valid)):
-                return valid
-        
-        # Try Levenshtein-like simple match (1 char difference)
-        for valid in valid_characters:
-            if valid == "STAGE_DIRECTION":
-                continue
-            if len(name) == len(valid):
-                diff = sum(1 for a, b in zip(name, valid) if a != b)
-                if diff <= 1:  # Allow 1 character difference
-                    return valid
-        
-        # Return None to filter out unknown characters
-        return None
-    
-    def _parse_shakespeare_remaining_optimized(
+    def _parse_shakespeare_remaining(
         self, 
         buffer: str, 
         start_pos: int,
-        already_sent: Set[Tuple[str, str]],
-        valid_characters: Set[str] = None
+        already_sent: Set[Tuple[str, str]]
     ) -> List[Dict[str, str]]:
-        """Parse phần còn lại với pre-compiled regex và character validation."""
+        """
+        Parse phần còn lại của buffer sau khi streaming kết thúc.
+        Xử lý trường hợp line cuối không có newline.
+        """
         remaining = buffer[start_pos:].strip()
         if not remaining:
             return []
@@ -438,7 +218,7 @@ class ChatService:
         results = []
         
         # Stage direction
-        stage_match = self._STAGE_DIRECTION_PATTERN.match(remaining)
+        stage_match = re.match(r'^\{(.+)\}$', remaining)
         if stage_match:
             content = stage_match.group(1).strip()
             if content and ("STAGE_DIRECTION", content) not in already_sent:
@@ -448,49 +228,21 @@ class ChatService:
                 })
             return results
         
-        # Character dialogue - use simple pattern
-        dialogue_match = self._DIALOGUE_PATTERN_SIMPLE.match(remaining)
+        # Character dialogue
+        dialogue_match = re.match(r'^\[([A-Z][A-Z\s]*)\]\s*(.+)$', remaining)
         if dialogue_match:
-            raw_char_name = dialogue_match.group(1).strip()
+            char_name = dialogue_match.group(1).strip().upper()
             speech = dialogue_match.group(2).strip()
-            
-            # Clean character name
-            char_name = self._clean_character_name(raw_char_name)
-            
-            # Clean speech
-            speech = self._clean_speech(speech)
-            
-            # Handle multiple speakers
-            if '[' in speech:
-                bracket_pos = speech.find('[')
-                speech = speech[:bracket_pos].strip().rstrip(',')
-                speech = self._clean_speech(speech)
-            
-            # Extract embedded directions
-            speech, embedded_directions = self._extract_embedded_directions(speech)
-            speech = self._clean_speech(speech)
-            
-            # Fuzzy match character
-            if valid_characters and char_name not in valid_characters:
-                char_name = self._fuzzy_match_character(char_name, valid_characters)
-            
             if char_name and speech and (char_name, speech) not in already_sent:
                 results.append({
                     "character": char_name,
                     "line": speech
                 })
-            
-            for direction in embedded_directions:
-                if ("STAGE_DIRECTION", direction) not in already_sent:
-                    results.append({
-                        "character": "STAGE_DIRECTION",
-                        "line": direction
-                    })
         
         return results
     
     # =========================================================================
-    # GEMINI STREAMING (unchanged logic, optimized serialization)
+    # GEMINI STREAMING 
     # =========================================================================
     
     async def _stream_gemini(
@@ -503,34 +255,39 @@ class ChatService:
         
         prompt = self._build_gemini_prompt(request, dialogue_string)
         
-        buffer = StringIO()
+        buffer = ""
         
+        # Stream từ Gemini
         async for chunk in llm_manager.stream_generate(prompt, temperature=request.temperature):
-            buffer.write(chunk)
+            buffer += chunk
             
+            # Send raw chunk
             yield self._format_sse({
                 "type": "chunk",
                 "data": {"text": chunk}
             })
         
-            parsed = self._try_parse_json_buffer_optimized(buffer.getvalue())
+            # Try parse JSON incrementally
+            parsed = self._try_parse_json_buffer(buffer)
             if parsed:
                 for item in parsed:
                     yield self._format_sse({
                         "type": "dialogue",
                         "data": item
                     })
+                    
                     await sleep(self.DIALOGUE_DELAY)
         
-        final_json = self._parse_api_output_to_json(buffer.getvalue())
+        # Final validation
+        final_json = self._parse_api_output_to_json(buffer)
         if self._validate_json(final_json):
+            # Send final complete dialogue if not sent yet
             yield self._format_sse({
                 "type": "complete_dialogue",
                 "data": final_json
             })
+            
             await sleep(self.DIALOGUE_DELAY)
-        
-        buffer.close()
     
     async def _stream_generic(
         self, 
@@ -538,6 +295,7 @@ class ChatService:
         dialogue_string: str
     ) -> AsyncGenerator[str, None]:
         """Generic streaming cho các model khác"""
+        
         prompt = self._build_gemini_prompt(request, dialogue_string)
         
         async for chunk in llm_manager.stream_generate(prompt):
@@ -547,35 +305,41 @@ class ChatService:
             })
     
     # =========================================================================
-    # OPTIMIZED HELPERS
+    # STREAMING HELPERS
     # =========================================================================
     
     def _format_sse(self, data: dict) -> str:
-        """Format SSE với orjson (nếu có)"""
-        return self._SSE_TEMPLATE.format(json_dumps(data))
+        """Format data as Server-Sent Events"""
+        return f"data: {json.dumps(data)}\n\n"
     
-    def _try_parse_json_buffer_optimized(self, buffer: str) -> List[Dict[str, str]]:
-        """Parse JSON với pre-compiled regex và orjson"""
+    def _try_parse_json_buffer(self, buffer: str) -> List[Dict[str, str]]:
+        """Try to parse JSON array incrementally"""
+        # Tìm complete JSON objects trong array
         try:
+            # Remove markdown if present
             clean = buffer.strip()
             if clean.startswith("```"):
-                clean = self._MARKDOWN_PATTERN.sub('', clean)
+                clean = re.sub(r'```(?:json)?\s*', '', clean)
             
+            # Try to find complete array
             if '[' in clean and ']' in clean:
                 start = clean.index('[')
                 end = clean.rindex(']') + 1
-                return json_loads(clean[start:end])
+                json_str = clean[start:end]
+                return json.loads(json_str)
         except:
             pass
         
         return []
     
     # =========================================================================
-    # NON-STREAMING METHOD
+    # NON-STREAMING METHOD 
     # =========================================================================
     
     async def continue_scene(self, request: ContinueSceneRequest) -> ContinueSceneResponse:
-        """Non-streaming version"""
+        """
+        Main logic để viết tiếp kịch bản (Non-streaming version)
+        """
         try:
             dialogue_string = self._preprocess_dialogue(request.previous_dialogue)
             continuation_json = []
@@ -584,6 +348,7 @@ class ChatService:
                 prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
                 raw_text, _ = llm_manager.generate_shakespeare_from_string(prompt, print_stream=False)
                 continuation_json = ShakespeareLLM.parse_generated_text(raw_text)
+
             else:
                 prompt = self._build_gemini_prompt(request, dialogue_string)
                 llm_output = llm_manager.generate(prompt, temperature=request.temperature)
@@ -591,7 +356,7 @@ class ChatService:
             
             if not self._validate_json(continuation_json):
                 if not continuation_json:
-                    raise ValueError("LLM generated empty response or invalid format.")
+                     raise ValueError("LLM generated empty response or invalid format.")
             
             characters_used = self._count_characters(
                 continuation_json, 
@@ -623,7 +388,7 @@ class ChatService:
             )
 
     # =========================================================================
-    # PROMPT BUILDERS (unchanged)
+    # PROMPT BUILDERS 
     # =========================================================================
 
     def _build_gemini_prompt(self, request: ContinueSceneRequest, dialogue_string: str) -> str:
@@ -713,7 +478,7 @@ Continue writing from the following text:
 """
 
     # =========================================================================
-    # PARSING & VALIDATION
+    # PARSING & VALIDATION 
     # =========================================================================
 
     def _parse_api_output_to_json(self, llm_output: str) -> List[Dict[str, str]]:
@@ -725,17 +490,16 @@ Continue writing from the following text:
             llm_output = llm_output.replace("```", "").strip()
         
         try:
-            parsed = json_loads(llm_output)
+            parsed = json.loads(llm_output)
             if isinstance(parsed, list):
                 return parsed
             if isinstance(parsed, dict) and "continue_dialogue" in parsed:
                 return parsed["continue_dialogue"]
             return []
-        except (ValueError, TypeError):
+        except (json.JSONDecodeError, ValueError):
             try:
                 converted = dialogue_preprocessor.string_to_json_array(llm_output)
-                if converted:
-                    return converted
+                if converted: return converted
             except:
                 pass
             return []
@@ -764,21 +528,17 @@ Continue writing from the following text:
         return str(dialogue_input)
     
     def _count_characters(self, dialogue_json: List[Dict[str, str]], characters: list) -> list:
-        # Pre-compute set for O(1) lookup
-        defined_names = {char.name.upper() for char in characters}
         characters_used = []
-        seen = set()
+        defined_names = {char.name.upper() for char in characters}
         
         for item in dialogue_json:
             char_name = item.get("character", "").strip().upper()
             if char_name == "STAGE_DIRECTION":
                 continue
-            if char_name in defined_names and char_name not in seen:
+            if char_name in defined_names and char_name not in characters_used:
                 characters_used.append(char_name)
-                seen.add(char_name)
         
         return characters_used
 
 
-# Singleton instance
 chat_service = ChatService()
