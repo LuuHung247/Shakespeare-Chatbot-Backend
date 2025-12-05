@@ -1,10 +1,11 @@
 from langchain.llms.base import LLM
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Generator
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, BitsAndBytesConfig
 import threading
 import time
 import re
+
 
 class ShakespeareLLM(LLM):
     """Custom LLM wrapper cho Shakespeare model với streaming và parsing support"""
@@ -50,7 +51,6 @@ class ShakespeareLLM(LLM):
                 )
                 
                 # Cấu hình lượng tử hóa 4-bit (NF4) để vừa VRAM 4GB
-                # Giúp tốc độ nhanh gấp 5-10 lần CPU mà chất lượng gần như không đổi
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
@@ -102,13 +102,73 @@ class ShakespeareLLM(LLM):
         continuation, _ = self._generate_internal(prompt, print_stream=False, stop_sequences=stop)
         return continuation
     
+    # =========================================================================
+    # STREAMING METHOD 
+    # =========================================================================
+    
+    def stream_generate(
+        self, 
+        prompt: str,
+        stop_sequences: Optional[List[str]] = None
+    ) -> Generator[str, None, None]:
+        """
+        Stream generation - yields text chunks as they're generated.
+        
+        This is the method called by LLMManager.stream_shakespeare()
+        
+        Args:
+            prompt: Input prompt
+            stop_sequences: Optional list of sequences to stop generation
+            
+        Yields:
+            Text chunks as they're generated
+        """
+        # Tokenize prompt
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        # Setup streamer
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+        
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            streamer=streamer,
+        )
+        
+        # Run model in separate thread
+        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread.start()
+        
+        # Yield chunks as they come
+        try:
+            for new_text in streamer:
+                # Check stop sequences
+                if stop_sequences and any(s in new_text for s in stop_sequences):
+                    break
+                yield new_text
+        finally:
+            # Ensure thread completes
+            thread.join(timeout=1.0)
+    
+    # =========================================================================
+    # INTERNAL GENERATION (Original)
+    # =========================================================================
+    
     def _generate_internal(
         self, 
         prompt: str, 
         print_stream: bool = False,
         stop_sequences: Optional[List[str]] = None
     ) -> tuple[str, dict]:
-        """Core generation logic với streaming"""
+        """Core generation logic với streaming - collects full output"""
         # Tokenize prompt
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
@@ -170,6 +230,10 @@ class ShakespeareLLM(LLM):
         """Public method để gọi generate kèm stats"""
         return self._generate_internal(prompt, print_stream=print_stream)
 
+    # =========================================================================
+    # PARSING (Original)
+    # =========================================================================
+    
     @staticmethod
     def parse_generated_text(raw_text: str) -> List[Dict[str, str]]:
         """

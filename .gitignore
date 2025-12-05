@@ -1,4 +1,26 @@
+# Byte-compiled
 __pycache__/
-.env
-.env.local
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env/
+.env.local/
+.venv/
+
+# Environment variables
+*.env
+*.env.*
+
+# VSCode
+.vscode/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Cache
+.cache/

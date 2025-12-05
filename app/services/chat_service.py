@@ -1,7 +1,6 @@
-from typing import List, Dict, Any, AsyncGenerator
+from typing import List, Dict, Any, AsyncGenerator, Set, Tuple
 import json
 import re
-from asyncio import sleep
 
 from app.models.requests import ContinueSceneRequest
 from app.models.responses import ContinueSceneResponse
@@ -10,10 +9,13 @@ from app.core.llm_manager import llm_manager
 from app.config import settings
 from app.llm.custom_shakespeare_llm import ShakespeareLLM
 
+
 class ChatService:
     """Service xử lý scene continuation hỗ trợ cả API LLM và Custom Local LLM với Streaming"""
-    CHUNK_DELAY = 0.05 
+    
+    # Chỉ giữ delay cho Gemini (backward compatibility)
     DIALOGUE_DELAY = 2.0
+    
     async def continue_scene_stream(
         self, 
         request: ContinueSceneRequest
@@ -39,12 +41,12 @@ class ChatService:
             
             # 3. PHÂN NHÁNH XỬ LÝ DỰA TRÊN MODEL
             if settings.LLM_TYPE == "shakespeare":
-                # === STREAM LOCAL SHAKESPEARE MODEL ===
+                # === STREAM LOCAL SHAKESPEARE MODEL (OPTIMIZED) ===
                 async for chunk in self._stream_shakespeare(request, dialogue_string):
                     yield chunk
                     
             elif settings.LLM_TYPE == "gemini":
-                # === STREAM GEMINI ===
+                # === STREAM GEMINI (unchanged) ===
                 async for chunk in self._stream_gemini(request, dialogue_string):
                     yield chunk
             else:
@@ -64,52 +66,184 @@ class ChatService:
                 "data": {"error": str(e)}
             })
     
+    # =========================================================================
+    # OPTIMIZED SHAKESPEARE STREAMING
+    # =========================================================================
+    
     async def _stream_shakespeare(
         self, 
         request: ContinueSceneRequest, 
         dialogue_string: str
     ) -> AsyncGenerator[str, None]:
-        """Stream output từ Shakespeare model"""
+        """
+        Optimized streaming cho Shakespeare model.
         
+        Tối ưu:
+        - Incremental parsing chỉ phần mới của buffer
+        - Track dialogues đã gửi bằng Set (O(1) lookup)
+        - Không có artificial delays
+        - Không parse lại toàn bộ buffer ở cuối
+        """
         prompt = self._build_shakespeare_prompt_structured(request, dialogue_string)
         
-        # Buffer để tích lũy text
         buffer = ""
-        current_dialogue = []
+        last_parsed_end = 0  # Track vị trí đã parse
+        sent_dialogues: Set[Tuple[str, str]] = set()  # (character, line) đã gửi
         
         # Stream từ model
         for chunk in llm_manager.stream_shakespeare(prompt):
             buffer += chunk
             
-            # Send raw chunk
+            # Gửi raw chunk ngay lập tức
             yield self._format_sse({
                 "type": "chunk",
                 "data": {"text": chunk}
             })
             
-            await sleep(self.CHUNK_DELAY)
-            # Parse incrementally nếu có đủ pattern
-            parsed_lines = self._try_parse_shakespeare_buffer(buffer)
-            if parsed_lines:
-                for line in parsed_lines:
-                    current_dialogue.append(line)
+            # Parse incremental - chỉ từ vị trí an toàn
+            new_dialogues, new_end = self._parse_shakespeare_incremental(
+                buffer, 
+                last_parsed_end,
+                sent_dialogues
+            )
+            
+            # Gửi các dialogue mới
+            for dialogue in new_dialogues:
+                dialogue_key = (dialogue["character"], dialogue["line"])
+                if dialogue_key not in sent_dialogues:
+                    sent_dialogues.add(dialogue_key)
                     yield self._format_sse({
                         "type": "dialogue",
-                        "data": line
+                        "data": dialogue
                     })
-                    await sleep(self.DIALOGUE_DELAY)
+            
+            # Update position
+            if new_end > last_parsed_end:
+                last_parsed_end = new_end
         
-        # Final parse
-        final_json = ShakespeareLLM.parse_generated_text(buffer)
+        # Final parse cho phần còn lại (nếu có incomplete line ở cuối)
+        remaining_dialogues = self._parse_shakespeare_remaining(
+            buffer, 
+            last_parsed_end, 
+            sent_dialogues
+        )
         
-        # Send any remaining unparsed dialogue
-        for item in final_json:
-            if item not in current_dialogue:
+        for dialogue in remaining_dialogues:
+            dialogue_key = (dialogue["character"], dialogue["line"])
+            if dialogue_key not in sent_dialogues:
+                sent_dialogues.add(dialogue_key)
                 yield self._format_sse({
                     "type": "dialogue",
-                    "data": item
+                    "data": dialogue
                 })
-                await sleep(self.DIALOGUE_DELAY)
+    
+    def _parse_shakespeare_incremental(
+        self, 
+        buffer: str, 
+        start_pos: int,
+        already_sent: Set[Tuple[str, str]]
+    ) -> Tuple[List[Dict[str, str]], int]:
+        """
+        Parse Shakespeare format từ vị trí start_pos.
+        Chỉ parse các lines HOÀN CHỈNH (kết thúc bằng newline).
+        
+        Returns:
+            - List dialogues mới tìm được
+            - Vị trí end position an toàn để tiếp tục parse
+        """
+        # Tìm vị trí newline cuối cùng - chỉ parse đến đó
+        last_newline = buffer.rfind('\n')
+        if last_newline <= start_pos:
+            # Chưa có line hoàn chỉnh mới
+            return [], start_pos
+        
+        # Lùi lại một chút từ start_pos để không miss partial match
+        safe_start = max(0, start_pos - 100)
+        parse_segment = buffer[safe_start:last_newline + 1]
+        
+        results = []
+        
+        # Pattern cho complete lines
+        # [CHARACTER] dialogue text
+        # {stage direction}
+        lines = parse_segment.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Stage direction: {action}
+            stage_match = re.match(r'^\{(.+)\}$', line)
+            if stage_match:
+                content = stage_match.group(1).strip()
+                if content:
+                    dialogue = {
+                        "character": "STAGE_DIRECTION",
+                        "line": content
+                    }
+                    if (dialogue["character"], dialogue["line"]) not in already_sent:
+                        results.append(dialogue)
+                continue
+            
+            # Character dialogue: [CHARACTER] text
+            dialogue_match = re.match(r'^\[([A-Z][A-Z\s]*)\]\s*(.+)$', line)
+            if dialogue_match:
+                char_name = dialogue_match.group(1).strip().upper()
+                speech = dialogue_match.group(2).strip()
+                if char_name and speech:
+                    dialogue = {
+                        "character": char_name,
+                        "line": speech
+                    }
+                    if (dialogue["character"], dialogue["line"]) not in already_sent:
+                        results.append(dialogue)
+        
+        return results, last_newline + 1
+    
+    def _parse_shakespeare_remaining(
+        self, 
+        buffer: str, 
+        start_pos: int,
+        already_sent: Set[Tuple[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Parse phần còn lại của buffer sau khi streaming kết thúc.
+        Xử lý trường hợp line cuối không có newline.
+        """
+        remaining = buffer[start_pos:].strip()
+        if not remaining:
+            return []
+        
+        results = []
+        
+        # Stage direction
+        stage_match = re.match(r'^\{(.+)\}$', remaining)
+        if stage_match:
+            content = stage_match.group(1).strip()
+            if content and ("STAGE_DIRECTION", content) not in already_sent:
+                results.append({
+                    "character": "STAGE_DIRECTION",
+                    "line": content
+                })
+            return results
+        
+        # Character dialogue
+        dialogue_match = re.match(r'^\[([A-Z][A-Z\s]*)\]\s*(.+)$', remaining)
+        if dialogue_match:
+            char_name = dialogue_match.group(1).strip().upper()
+            speech = dialogue_match.group(2).strip()
+            if char_name and speech and (char_name, speech) not in already_sent:
+                results.append({
+                    "character": char_name,
+                    "line": speech
+                })
+        
+        return results
+    
+    # =========================================================================
+    # GEMINI STREAMING 
+    # =========================================================================
     
     async def _stream_gemini(
         self, 
@@ -117,6 +251,7 @@ class ChatService:
         dialogue_string: str
     ) -> AsyncGenerator[str, None]:
         """Stream output từ Gemini"""
+        from asyncio import sleep
         
         prompt = self._build_gemini_prompt(request, dialogue_string)
         
@@ -131,8 +266,7 @@ class ChatService:
                 "type": "chunk",
                 "data": {"text": chunk}
             })
-            
-            await sleep(self.CHUNK_DELAY)
+        
             # Try parse JSON incrementally
             parsed = self._try_parse_json_buffer(buffer)
             if parsed:
@@ -178,27 +312,6 @@ class ChatService:
         """Format data as Server-Sent Events"""
         return f"data: {json.dumps(data)}\n\n"
     
-    def _try_parse_shakespeare_buffer(self, buffer: str) -> List[Dict[str, str]]:
-        """Try to parse Shakespeare format incrementally"""
-        # Tìm complete patterns: [CHARACTER] line hoặc {stage direction}
-        pattern = r'\[([A-Z\s]+)\]\s*([^\[\{]+)|(\{[^\}]+\})'
-        matches = re.finditer(pattern, buffer)
-        
-        result = []
-        for match in matches:
-            if match.group(1):  # Character dialogue
-                result.append({
-                    "character": match.group(1).strip(),
-                    "line": match.group(2).strip()
-                })
-            elif match.group(3):  # Stage direction
-                result.append({
-                    "character": "STAGE_DIRECTION",
-                    "line": match.group(3).strip('{}').strip()
-                })
-        
-        return result
-    
     def _try_parse_json_buffer(self, buffer: str) -> List[Dict[str, str]]:
         """Try to parse JSON array incrementally"""
         # Tìm complete JSON objects trong array
@@ -220,7 +333,7 @@ class ChatService:
         return []
     
     # =========================================================================
-    # NON-STREAMING METHOD (Kept for backward compatibility)
+    # NON-STREAMING METHOD 
     # =========================================================================
     
     async def continue_scene(self, request: ContinueSceneRequest) -> ContinueSceneResponse:
@@ -275,7 +388,7 @@ class ChatService:
             )
 
     # =========================================================================
-    # PROMPT BUILDERS (unchanged)
+    # PROMPT BUILDERS 
     # =========================================================================
 
     def _build_gemini_prompt(self, request: ContinueSceneRequest, dialogue_string: str) -> str:
@@ -365,7 +478,7 @@ Continue writing from the following text:
 """
 
     # =========================================================================
-    # PARSING & VALIDATION (unchanged)
+    # PARSING & VALIDATION 
     # =========================================================================
 
     def _parse_api_output_to_json(self, llm_output: str) -> List[Dict[str, str]]:
@@ -426,5 +539,6 @@ Continue writing from the following text:
                 characters_used.append(char_name)
         
         return characters_used
+
 
 chat_service = ChatService()

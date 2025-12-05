@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     # LLM Settings
    
    
-    LLM_TYPE: Literal["gemini", "local", "shakespeare"] = "gemini"
+    LLM_TYPE: Literal["gemini", "shakespeare"] = "gemini"
     # Google Gemini
     GOOGLE_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-flash"
