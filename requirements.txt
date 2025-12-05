@@ -27,3 +27,4 @@ loguru==0.7.2
 
 pytest==7.4.4
 httpx==0.26.0
+orjson
