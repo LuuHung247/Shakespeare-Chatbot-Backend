@@ -100,6 +100,6 @@ class ContinueSceneRequest(BaseModel):
                     "scene_summary": "A heated confrontation in a tavern between Pistol and others. Doll mocks his pretensions. The Hostess tries to calm the situation."
                 },
                 "style": "shakespeare",
-                "temperature": 0.8
+                "temperature": 0.3
             }
         }

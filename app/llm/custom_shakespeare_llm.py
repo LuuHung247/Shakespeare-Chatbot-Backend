@@ -19,7 +19,7 @@ class ShakespeareLLM(LLM):
     
     model_name: str = "Hancovirus/shakespear_Qwen2.5-3B-Instruct"
     max_new_tokens: int = 512
-    temperature: float = 0.7
+    temperature: float = 0.3
     top_p: float = 0.9
     
     # Anti-repetition parameters

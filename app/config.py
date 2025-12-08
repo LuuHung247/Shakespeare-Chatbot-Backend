@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     
     # Generation Settings
     MAX_TOKENS: int = 2000
-    TEMPERATURE: float = 0.8
+    TEMPERATURE: float = 0.3
     TOP_P: float = 0.9
     
     # Server Settings
