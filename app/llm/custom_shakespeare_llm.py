@@ -18,13 +18,14 @@ class ShakespeareLLM(LLM):
     """
     
     model_name: str = "Hancovirus/shakespear_Qwen2.5-3B-Instruct"
-    max_new_tokens: int = 512
-    temperature: float = 0.3
+    max_new_tokens: int = 1024
+    min_new_tokens: int = 100
+    temperature: float = 0.6
     top_p: float = 0.9
     
     # Anti-repetition parameters
     repetition_penalty: float = 1.1  # >1.0 để phạt lặp token
-    no_repeat_ngram_size: int = 4    # Cấm lặp n-gram size n
+    no_repeat_ngram_size: int = 8    # Cấm lặp n-gram size n
     
     tokenizer: Any = None
     model: Any = None
@@ -37,22 +38,24 @@ class ShakespeareLLM(LLM):
         # Extract custom params
         model_name = kwargs.pop('model_name', "Hancovirus/shakespear_Qwen2.5-3B-Instruct")
         max_new_tokens = kwargs.pop('max_new_tokens', 512)
+        min_new_tokens = kwargs.pop('min_new_tokens', 100)
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
         repetition_penalty = kwargs.pop('repetition_penalty', 1.1)
         no_repeat_ngram_size = kwargs.pop('no_repeat_ngram_size', 4)
-        
+
         super().__init__(**kwargs)
-        
+
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
+        self.min_new_tokens = min_new_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.no_repeat_ngram_size = no_repeat_ngram_size
         self.tokenizer = None
         self.model = None
-        
+
         self._load_model()
     
     def _load_model(self):
@@ -104,6 +107,7 @@ class ShakespeareLLM(LLM):
         return {
             "model_name": self.model_name,
             "max_new_tokens": self.max_new_tokens,
+            "min_new_tokens": self.min_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "repetition_penalty": self.repetition_penalty,
@@ -111,7 +115,7 @@ class ShakespeareLLM(LLM):
         }
     
     def _build_generation_kwargs(
-        self, 
+        self,
         inputs: Dict[str, Any],
         streamer: Optional[TextIteratorStreamer] = None,
         **overrides
@@ -123,16 +127,17 @@ class ShakespeareLLM(LLM):
         gen_kwargs = {
             **inputs,
             "max_new_tokens": overrides.get("max_new_tokens", self.max_new_tokens),
+            "min_new_tokens": overrides.get("min_new_tokens", self.min_new_tokens),
             "do_sample": True,
             "temperature": overrides.get("temperature", self.temperature),
             "top_p": overrides.get("top_p", self.top_p),
             "repetition_penalty": overrides.get("repetition_penalty", self.repetition_penalty),
             "no_repeat_ngram_size": overrides.get("no_repeat_ngram_size", self.no_repeat_ngram_size),
         }
-        
+
         if streamer is not None:
             gen_kwargs["streamer"] = streamer
-            
+
         return gen_kwargs
     
     def _call(
